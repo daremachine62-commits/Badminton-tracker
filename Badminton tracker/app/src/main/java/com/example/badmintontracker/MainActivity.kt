@@ -1,6 +1,7 @@
 package com.example.badmintontracker
 
 import android.Manifest
+import android.content.Context
 import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
@@ -84,6 +85,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONException
+import org.json.JSONObject
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -98,7 +103,18 @@ private data class HitLabel(
     val elapsedMillis: Long,
 )
 
-private data class CourtPoint(val x: Float, val y: Float)
+private data class TrainingSession(
+    val completedAtMillis: Long,
+    val durationMillis: Long,
+    val hitCount: Int,
+)
+
+private data class TrainingHistoryLoad(
+    val sessions: List<TrainingSession>,
+    val error: String?,
+)
+
+internal data class CourtPoint(val x: Float, val y: Float)
 
 private data class MotionSample(
     val timeMillis: Long,
@@ -111,7 +127,11 @@ private data class VideoAnalysisResult(
     val samplingIntervalMillis: Long,
     val samples: List<MotionSample>,
     val previewFrame: Bitmap,
+    val detectedCourt: DetectedCourt?,
 )
+
+private const val TRAINING_HISTORY_PREFERENCES = "training_history"
+private const val TRAINING_HISTORY_KEY = "sessions"
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -130,24 +150,54 @@ class MainActivity : ComponentActivity() {
 private fun TrackerApp() {
     var sessionStarted by remember { mutableStateOf(false) }
     var analysisOpened by remember { mutableStateOf(false) }
+    var historyOpened by remember { mutableStateOf(false) }
     val playerNames = remember { mutableStateListOf("Player 1", "Player 2", "Player 3", "Player 4") }
     val hitLabels = remember { mutableStateListOf<HitLabel>() }
     var sessionStartMillis by remember { mutableLongStateOf(0L) }
+    val context = LocalContext.current
+    val historyLoad = remember(context) { loadTrainingHistory(context) }
+    val trainingHistory = remember {
+        mutableStateListOf<TrainingSession>().apply { addAll(historyLoad.sessions) }
+    }
+    var historyError by remember { mutableStateOf(historyLoad.error) }
 
     if (sessionStarted) {
         SessionScreen(
             playerNames = playerNames,
             hitLabels = hitLabels,
-            onBack = { sessionStarted = false },
+            onEndSession = {
+                val session = TrainingSession(
+                    completedAtMillis = System.currentTimeMillis(),
+                    durationMillis = (
+                        android.os.SystemClock.elapsedRealtime() - sessionStartMillis
+                        ).coerceAtLeast(0L),
+                    hitCount = hitLabels.size,
+                )
+                trainingHistory.add(0, session)
+                historyError = if (saveTrainingHistory(context, trainingHistory.toList())) {
+                    null
+                } else {
+                    "Could not save this session to training history."
+                }
+                sessionStarted = false
+                historyOpened = true
+            },
             onStartSession = { sessionStartMillis = android.os.SystemClock.elapsedRealtime() },
             sessionStartMillis = sessionStartMillis,
         )
     } else if (analysisOpened) {
         VideoAnalysisScreen(onBack = { analysisOpened = false })
+    } else if (historyOpened) {
+        TrainingHistoryScreen(
+            sessions = trainingHistory,
+            error = historyError,
+            onBack = { historyOpened = false },
+        )
     } else {
         SetupScreen(
             playerNames = playerNames,
             onAnalyzeVideo = { analysisOpened = true },
+            onShowHistory = { historyOpened = true },
             onStart = {
                 hitLabels.clear()
                 sessionStartMillis = android.os.SystemClock.elapsedRealtime()
@@ -162,6 +212,7 @@ private fun TrackerApp() {
 private fun SetupScreen(
     playerNames: MutableList<String>,
     onAnalyzeVideo: () -> Unit,
+    onShowHistory: () -> Unit,
     onStart: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
@@ -206,8 +257,62 @@ private fun SetupScreen(
         OutlinedButton(onClick = onAnalyzeVideo, modifier = Modifier.fillMaxWidth()) {
             Text("Analyze a local video or video URL")
         }
+        OutlinedButton(onClick = onShowHistory, modifier = Modifier.fillMaxWidth()) {
+            Text("Training progress")
+        }
         Button(onClick = onStart, modifier = Modifier.fillMaxWidth()) {
             Text("Start live camera session")
+        }
+    }
+}
+
+@Composable
+private fun TrainingHistoryScreen(
+    sessions: List<TrainingSession>,
+    error: String?,
+    onBack: () -> Unit,
+) {
+    val dateFormat = remember { SimpleDateFormat("MMM d, yyyy, h:mm a", Locale.getDefault()) }
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(24.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text("Training progress", style = MaterialTheme.typography.headlineMedium)
+        if (error != null) {
+            Text(error, color = MaterialTheme.colorScheme.error)
+        }
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text("Completed sessions: ${sessions.size}")
+                Text("Total training time: ${formatElapsed(sessions.sumOf { it.durationMillis })}")
+                Text("Tagged hits: ${sessions.sumOf { it.hitCount }}")
+            }
+        }
+        Text("Recent sessions", style = MaterialTheme.typography.titleLarge)
+        if (sessions.isEmpty()) {
+            Text("No completed training sessions yet. End a live session to add it here.")
+        } else {
+            sessions.take(20).forEach { session ->
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Text(dateFormat.format(Date(session.completedAtMillis)))
+                        Text("Duration: ${formatElapsed(session.durationMillis)}")
+                        Text("Tagged hits: ${session.hitCount}")
+                    }
+                }
+            }
+        }
+        OutlinedButton(onClick = onBack, modifier = Modifier.fillMaxWidth()) {
+            Text("Back")
         }
     }
 }
@@ -241,14 +346,11 @@ private fun VideoAnalysisPanel() {
     var analysisResult by remember { mutableStateOf<VideoAnalysisResult?>(null) }
     var status by remember { mutableStateOf("") }
     var analyzing by remember { mutableStateOf(false) }
-    val courtCorners = remember { mutableStateListOf<CourtPoint>() }
-
     fun analyze(uri: Uri, sourceName: String) {
         analyzing = true
         status = "Extracting frames and comparing motion…"
         selectedVideoName = sourceName
         analysisResult = null
-        courtCorners.clear()
         scope.launch {
             try {
                 analysisResult = withContext(Dispatchers.IO) {
@@ -332,7 +434,6 @@ private fun VideoAnalysisPanel() {
             VideoAnalysisSummary(
                 sourceName = selectedVideoName,
                 result = result,
-                courtCorners = courtCorners,
             )
         }
     }
@@ -342,8 +443,15 @@ private fun VideoAnalysisPanel() {
 private fun VideoAnalysisSummary(
     sourceName: String,
     result: VideoAnalysisResult,
-    courtCorners: MutableList<CourtPoint>,
 ) {
+    val courtCorners = remember(result) {
+        mutableStateListOf<CourtPoint>().apply {
+            result.detectedCourt?.corners?.let(::addAll)
+        }
+    }
+    var autoDetected by remember(result) {
+        mutableStateOf(result.detectedCourt != null)
+    }
     val maxChange = result.samples.maxOfOrNull { it.changePercent } ?: 0f
     val motionSamples = result.samples.count { it.center != null }
     val calibratedSpeed = if (courtCorners.size == 4) {
@@ -369,17 +477,32 @@ private fun VideoAnalysisSummary(
                     "trained detection model. Motion candidates may be camera shake or players.",
             )
             Text(
-                "Tap the four doubles-court corners in order (near the top-left, top-right, " +
-                    "bottom-right, bottom-left of the video frame) to calibrate.",
+                if (autoDetected) {
+                    "Court auto-estimated from visible lines using standard doubles-court " +
+                        "dimensions. Tap an estimated corner to adjust it."
+                } else {
+                    "Court was not detected automatically. Tap its four corners in order " +
+                        "(top-left, top-right, bottom-right, bottom-left) to calibrate."
+                },
             )
-            CourtCalibrationCanvas(result.previewFrame, courtCorners)
+            result.detectedCourt?.let { detection ->
+                Text("Auto-detection confidence: ${(detection.confidence * 100).toInt()}%")
+            }
+            CourtCalibrationCanvas(
+                bitmap = result.previewFrame,
+                courtCorners = courtCorners,
+                onManualAdjustment = { autoDetected = false },
+            )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Corners: ${courtCorners.size}/4")
                 OutlinedButton(
-                    onClick = courtCorners::clear,
+                    onClick = {
+                        courtCorners.clear()
+                        autoDetected = false
+                    },
                     enabled = courtCorners.isNotEmpty(),
                 ) {
-                    Text("Reset")
+                    Text(if (autoDetected) "Reset" else "Clear")
                 }
             }
             if (calibratedSpeed != null) {
@@ -401,26 +524,39 @@ private fun VideoAnalysisSummary(
 private fun CourtCalibrationCanvas(
     bitmap: Bitmap,
     courtCorners: MutableList<CourtPoint>,
+    onManualAdjustment: () -> Unit,
 ) {
+    DisposableEffect(bitmap) {
+        onDispose { bitmap.recycle() }
+    }
     Canvas(
         modifier = Modifier
             .fillMaxWidth()
             .height(220.dp)
             .pointerInput(bitmap, courtCorners.size) {
                 detectTapGestures { tap ->
-                    if (courtCorners.size >= 4) return@detectTapGestures
                     val scale = min(size.width / bitmap.width, size.height / bitmap.height)
                     val left = (size.width - bitmap.width * scale) / 2f
                     val top = (size.height - bitmap.height * scale) / 2f
                     val x = (tap.x - left) / (bitmap.width * scale)
                     val y = (tap.y - top) / (bitmap.height * scale)
                     if (x in 0f..1f && y in 0f..1f) {
-                        courtCorners.add(CourtPoint(x, y))
+                        onManualAdjustment()
+                        if (courtCorners.size < 4) {
+                            courtCorners.add(CourtPoint(x, y))
+                        } else {
+                            val nearest = courtCorners.indices.minBy { index ->
+                                val dx = courtCorners[index].x - x
+                                val dy = courtCorners[index].y - y
+                                dx * dx + dy * dy
+                            }
+                            courtCorners[nearest] = CourtPoint(x, y)
+                        }
                     }
                 }
             },
     ) {
-        drawContext.canvas.nativeCanvas.drawColor(android.graphics.Color.DKGRAY)
+        drawRect(color = androidx.compose.ui.graphics.Color.DarkGray)
         val scale = min(size.width / bitmap.width, size.height / bitmap.height)
         val width = bitmap.width * scale
         val height = bitmap.height * scale
@@ -432,6 +568,18 @@ private fun CourtCalibrationCanvas(
             RectF(left, top, left + width, top + height),
             Paint(Paint.FILTER_BITMAP_FLAG),
         )
+        if (courtCorners.size == 4) {
+            courtCorners.indices.forEach { index ->
+                val start = courtCorners[index]
+                val end = courtCorners[(index + 1) % courtCorners.size]
+                drawLine(
+                    color = androidx.compose.ui.graphics.Color.Yellow,
+                    start = Offset(left + start.x * width, top + start.y * height),
+                    end = Offset(left + end.x * width, top + end.y * height),
+                    strokeWidth = 2.dp.toPx(),
+                )
+            }
+        }
         courtCorners.forEachIndexed { index, point ->
             drawCircle(
                 color = androidx.compose.ui.graphics.Color.Yellow,
@@ -453,11 +601,21 @@ private fun CourtCalibrationCanvas(
 
 private fun analyzeVideo(context: android.content.Context, uri: Uri): VideoAnalysisResult {
     val retriever = MediaMetadataRetriever()
+    var localVideoFile: File? = null
     try {
         if (uri.scheme == "http" || uri.scheme == "https") {
             retriever.setDataSource(uri.toString(), emptyMap())
         } else {
-            retriever.setDataSource(context, uri)
+            val tempFile = File.createTempFile("badminton-analysis-", ".mp4", context.cacheDir)
+            localVideoFile = tempFile
+            val input = context.contentResolver.openInputStream(uri)
+                ?: error("Could not open the selected video. Choose another local video file.")
+            input.use { source ->
+                tempFile.outputStream().use { destination ->
+                    source.copyTo(destination)
+                }
+            }
+            retriever.setDataSource(tempFile.absolutePath)
         }
         val durationMillis = retriever
             .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
@@ -468,6 +626,8 @@ private fun analyzeVideo(context: android.content.Context, uri: Uri): VideoAnaly
         val frameCount = min(300, (durationMillis / intervalMillis + 1).toInt())
         var previousLuminance: IntArray? = null
         var previewFrame: Bitmap? = null
+        var courtPreviewFrame: Bitmap? = null
+        var detectedCourt: DetectedCourt? = null
         val samples = ArrayList<MotionSample>(frameCount)
         for (frameIndex in 0 until frameCount) {
             val timeMillis = min(durationMillis - 1, frameIndex * intervalMillis)
@@ -479,6 +639,23 @@ private fun analyzeVideo(context: android.content.Context, uri: Uri): VideoAnaly
             ) ?: continue
             if (previewFrame == null) {
                 previewFrame = frame.copy(Bitmap.Config.ARGB_8888, false)
+            }
+            if (frameIndex < 30 && frameIndex % 3 == 0) {
+                val courtWidth = 160
+                val courtHeight = 90
+                val candidate = detectCourt(
+                    luminance = bitmapLuminance(frame, courtWidth, courtHeight),
+                    width = courtWidth,
+                    height = courtHeight,
+                    courtLineMask = bitmapCourtLineMask(frame, courtWidth, courtHeight),
+                )
+                if (candidate != null &&
+                    (detectedCourt == null || candidate.confidence > detectedCourt.confidence)
+                ) {
+                    detectedCourt = candidate
+                    courtPreviewFrame?.recycle()
+                    courtPreviewFrame = frame.copy(Bitmap.Config.ARGB_8888, false)
+                }
             }
             val current = bitmapLuminance(frame, 64, 36)
             frame.recycle()
@@ -494,10 +671,13 @@ private fun analyzeVideo(context: android.content.Context, uri: Uri): VideoAnaly
             durationMillis = durationMillis,
             samplingIntervalMillis = intervalMillis,
             samples = samples,
-            previewFrame = previewFrame ?: error("No readable video frames were found."),
+            previewFrame = courtPreviewFrame ?: previewFrame
+                ?: error("No readable video frames were found."),
+            detectedCourt = detectedCourt,
         )
     } finally {
         retriever.release()
+        localVideoFile?.delete()
     }
 }
 
@@ -626,12 +806,15 @@ private fun mapToCourt(point: CourtPoint, h: DoubleArray): CourtPoint? {
 private fun SessionScreen(
     playerNames: List<String>,
     hitLabels: MutableList<HitLabel>,
-    onBack: () -> Unit,
+    onEndSession: () -> Unit,
     onStartSession: () -> Unit,
     sessionStartMillis: Long,
 ) {
     val context = LocalContext.current
     var selectedPlayer by remember { mutableStateOf(0) }
+    val liveCourtCorners = remember { mutableStateListOf<CourtPoint>() }
+    var liveCourtFrame by remember { mutableStateOf<Bitmap?>(null) }
+    var liveCourtManuallyAdjusted by remember { mutableStateOf(false) }
     var hasCameraPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
@@ -663,7 +846,40 @@ private fun SessionScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(240.dp),
+                onCourtFrame = { frame, detection ->
+                    liveCourtFrame = frame
+                    if (!liveCourtManuallyAdjusted && detection != null) {
+                        liveCourtCorners.clear()
+                        liveCourtCorners.addAll(detection.corners)
+                    }
+                },
             )
+            liveCourtFrame?.let { frame ->
+                Text(
+                    if (liveCourtCorners.size == 4) {
+                        "Live court estimate. Tap a corner to adjust it."
+                    } else {
+                        "Searching for court lines. If needed, tap the four corners to set them."
+                    },
+                )
+                CourtCalibrationCanvas(
+                    bitmap = frame,
+                    courtCorners = liveCourtCorners,
+                    onManualAdjustment = { liveCourtManuallyAdjusted = true },
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Live corners: ${liveCourtCorners.size}/4")
+                    OutlinedButton(
+                        onClick = {
+                            liveCourtManuallyAdjusted = false
+                            liveCourtCorners.clear()
+                        },
+                        enabled = liveCourtManuallyAdjusted || liveCourtCorners.isNotEmpty(),
+                    ) {
+                        Text("Reset auto-detection")
+                    }
+                }
+            }
         } else {
             Text("Camera permission is required to record the match.")
             Button(onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) }) {
@@ -711,14 +927,63 @@ private fun SessionScreen(
             Text("${formatElapsed(hit.elapsedMillis)}  ·  ${hit.player}")
         }
         Spacer(modifier = Modifier.height(4.dp))
-        OutlinedButton(onClick = onBack, modifier = Modifier.fillMaxWidth()) {
+        OutlinedButton(onClick = onEndSession, modifier = Modifier.fillMaxWidth()) {
             Text("End session")
         }
     }
 }
 
+private fun loadTrainingHistory(context: Context): TrainingHistoryLoad {
+    val preferences = context.getSharedPreferences(
+        TRAINING_HISTORY_PREFERENCES,
+        Context.MODE_PRIVATE,
+    )
+    val encodedSessions = preferences.getString(TRAINING_HISTORY_KEY, "[]") ?: "[]"
+    return try {
+        val sessions = JSONArray(encodedSessions)
+        val history = List(sessions.length()) { index ->
+            val item = sessions.getJSONObject(index)
+            TrainingSession(
+                completedAtMillis = item.getLong("completedAtMillis"),
+                durationMillis = item.getLong("durationMillis"),
+                hitCount = item.getInt("hitCount"),
+            ).also {
+                if (it.completedAtMillis <= 0L || it.durationMillis < 0L || it.hitCount < 0) {
+                    throw JSONException("Invalid training session values.")
+                }
+            }
+        }.sortedByDescending { it.completedAtMillis }
+        TrainingHistoryLoad(history, null)
+    } catch (exception: JSONException) {
+        TrainingHistoryLoad(emptyList(), "Saved training history could not be read.")
+    }
+}
+
+private fun saveTrainingHistory(context: Context, sessions: List<TrainingSession>): Boolean {
+    val encodedSessions = JSONArray().apply {
+        sessions.forEach { session ->
+            put(
+                JSONObject()
+                    .put("completedAtMillis", session.completedAtMillis)
+                    .put("durationMillis", session.durationMillis)
+                    .put("hitCount", session.hitCount),
+            )
+        }
+    }.toString()
+    return context.getSharedPreferences(
+        TRAINING_HISTORY_PREFERENCES,
+        Context.MODE_PRIVATE,
+    )
+        .edit()
+        .putString(TRAINING_HISTORY_KEY, encodedSessions)
+        .commit()
+}
+
 @Composable
-private fun CameraRecorder(modifier: Modifier = Modifier) {
+private fun CameraRecorder(
+    modifier: Modifier = Modifier,
+    onCourtFrame: (Bitmap, DetectedCourt?) -> Unit,
+) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val mainExecutor = remember(context) { ContextCompat.getMainExecutor(context) }
@@ -731,6 +996,7 @@ private fun CameraRecorder(modifier: Modifier = Modifier) {
     var recordingStatus by remember { mutableStateOf("Preparing camera…") }
     var lastSavedVideo by remember { mutableStateOf<Uri?>(null) }
     var liveMotionStatus by remember { mutableStateOf("Waiting for camera frames…") }
+    val currentOnCourtFrame = rememberUpdatedState(onCourtFrame)
     val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
 
     AndroidView(
@@ -772,18 +1038,19 @@ private fun CameraRecorder(modifier: Modifier = Modifier) {
                                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                                 .build()
                             var previousLuminance: IntArray? = null
-                                var lastMotionStatusUpdateMillis = 0L
-                                imageAnalysis.setAnalyzer(analysisExecutor) { image ->
-                                    try {
-                                        val current = imageProxyLuminance(image)
-                                        val previous = previousLuminance
-                                        if (previous != null) {
+                            var lastMotionStatusUpdateMillis = 0L
+                            var lastCourtDetectionMillis = 0L
+                            imageAnalysis.setAnalyzer(analysisExecutor) { image ->
+                                try {
+                                    val current = imageProxyLuminance(image)
+                                    val previous = previousLuminance
+                                    val now = android.os.SystemClock.elapsedRealtime()
+                                    if (previous != null) {
                                         val motion = compareMotion(
                                             previous,
                                             current,
                                             image.imageInfo.timestamp / 1_000_000L,
                                         )
-                                        val now = android.os.SystemClock.elapsedRealtime()
                                         if (now - lastMotionStatusUpdateMillis >= 500) {
                                             lastMotionStatusUpdateMillis = now
                                             mainExecutor.execute {
@@ -794,6 +1061,35 @@ private fun CameraRecorder(modifier: Modifier = Modifier) {
                                         }
                                     }
                                     previousLuminance = current
+                                    if (now - lastCourtDetectionMillis >= 1_000) {
+                                        lastCourtDetectionMillis = now
+                                        val courtWidth = 160
+                                        val courtHeight = 90
+                                        val courtLuminance = imageProxyLuminance(
+                                            image,
+                                            courtWidth,
+                                            courtHeight,
+                                        )
+                                        val courtLineMask = imageProxyCourtLineMask(
+                                            image,
+                                            courtWidth,
+                                            courtHeight,
+                                        )
+                                        val courtFrame = grayscaleBitmap(
+                                            courtLuminance,
+                                            courtWidth,
+                                            courtHeight,
+                                        )
+                                        val detection = detectCourt(
+                                            courtLuminance,
+                                            courtWidth,
+                                            courtHeight,
+                                            courtLineMask,
+                                        )
+                                        mainExecutor.execute {
+                                            currentOnCourtFrame.value(courtFrame, detection)
+                                        }
+                                    }
                                 } finally {
                                     image.close()
                                 }
@@ -899,19 +1195,79 @@ private fun CameraRecorder(modifier: Modifier = Modifier) {
     }
 }
 
-private fun imageProxyLuminance(image: ImageProxy): IntArray {
+private fun imageProxyLuminance(
+    image: ImageProxy,
+    sampleWidth: Int = 64,
+    sampleHeight: Int = 36,
+): IntArray {
     val plane = image.planes[0]
     val buffer = plane.buffer
-    val result = IntArray(64 * 36)
-    for (y in 0 until 36) {
-        val sourceY = y * image.height / 36
-        for (x in 0 until 64) {
-            val sourceX = x * image.width / 64
+    val result = IntArray(sampleWidth * sampleHeight)
+    for (y in 0 until sampleHeight) {
+        val sourceY = y * image.height / sampleHeight
+        for (x in 0 until sampleWidth) {
+            val sourceX = x * image.width / sampleWidth
             val index = sourceY * plane.rowStride + sourceX * plane.pixelStride
-            result[y * 64 + x] = buffer.get(index).toInt() and 0xff
+            result[y * sampleWidth + x] = buffer.get(index).toInt() and 0xff
         }
     }
     return result
+}
+
+private fun bitmapCourtLineMask(bitmap: Bitmap, sampleWidth: Int, sampleHeight: Int): BooleanArray? {
+    val pixels = IntArray(sampleWidth * sampleHeight)
+    for (y in 0 until sampleHeight) {
+        for (x in 0 until sampleWidth) {
+            pixels[y * sampleWidth + x] = bitmap.getPixel(
+                x * bitmap.width / sampleWidth,
+                y * bitmap.height / sampleHeight,
+            )
+        }
+    }
+    return courtLineMaskFromRgb(pixels, sampleWidth, sampleHeight)
+}
+
+private fun imageProxyCourtLineMask(
+    image: ImageProxy,
+    sampleWidth: Int,
+    sampleHeight: Int,
+): BooleanArray? {
+    if (image.planes.size < 3) return null
+    val yPlane = image.planes[0]
+    val uPlane = image.planes[1]
+    val vPlane = image.planes[2]
+    val yBuffer = yPlane.buffer
+    val uBuffer = uPlane.buffer
+    val vBuffer = vPlane.buffer
+    val pixels = IntArray(sampleWidth * sampleHeight)
+    for (y in 0 until sampleHeight) {
+        val sourceY = y * image.height / sampleHeight
+        for (x in 0 until sampleWidth) {
+            val sourceX = x * image.width / sampleWidth
+            val luminance = yBuffer.get(
+                sourceY * yPlane.rowStride + sourceX * yPlane.pixelStride,
+            ).toInt() and 0xff
+            val chromaIndex = (sourceY / 2) * uPlane.rowStride +
+                (sourceX / 2) * uPlane.pixelStride
+            val u = (uBuffer.get(chromaIndex).toInt() and 0xff) - 128
+            val v = (vBuffer.get(chromaIndex).toInt() and 0xff) - 128
+            val red = (luminance + 1.402 * v).toInt().coerceIn(0, 255)
+            val green = (luminance - 0.344136 * u - 0.714136 * v).toInt().coerceIn(0, 255)
+            val blue = (luminance + 1.772 * u).toInt().coerceIn(0, 255)
+            pixels[y * sampleWidth + x] = android.graphics.Color.rgb(red, green, blue)
+        }
+    }
+    return courtLineMaskFromRgb(pixels, sampleWidth, sampleHeight)
+}
+
+private fun grayscaleBitmap(luminance: IntArray, width: Int, height: Int): Bitmap {
+    val pixels = IntArray(luminance.size) { index ->
+        val value = luminance[index].coerceIn(0, 255)
+        android.graphics.Color.rgb(value, value, value)
+    }
+    return Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).apply {
+        setPixels(pixels, 0, width, 0, 0, width, height)
+    }
 }
 
 private fun formatElapsed(elapsedMillis: Long): String {
