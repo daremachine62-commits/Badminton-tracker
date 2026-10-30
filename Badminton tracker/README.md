@@ -10,7 +10,9 @@ timestamped hit labels, and experimental video motion analysis.
   `Movies/BadmintonTracker`.
 - Manually tag a hit with the selected player and elapsed session time.
 - Save completed live sessions locally and review recent durations and tagged
-  hit totals. These activity totals do not infer skill improvement.
+  hit totals, including a month-grouped treemap where tile area represents
+  session duration and color represents tagged hits. These activity totals do
+  not infer skill improvement.
 - Analyze an imported local video or a direct HTTPS video-file URL by sampling
   frames and highlighting coarse frame-to-frame motion candidates.
 - Automatically estimate court corners from bright court-line candidates in
@@ -20,16 +22,20 @@ timestamped hit labels, and experimental video motion analysis.
   coarse frame-change score during a camera session.
 
 Court detection uses a lightweight bright-line geometry heuristic, not a
-trained court model. Background lines can cause false estimates, so check and
-adjust the highlighted corners. When some court edges are outside the frame,
-the estimate extrapolates visible lines and assumes standard 13.4 m by 6.1 m
-doubles-court dimensions; dimensions provide scale, not evidence that an
-invisible corner was detected. Motion candidates can be caused by players,
+trained court model. Background lines can cause false estimates, so check the
+highlighted corners. When some court edges are outside the frame, the app only
+projects missing corners when court markings and a net-line reference support
+the geometry. Dimensions use standard 13.4 m by 6.1 m doubles-court geometry;
+they are estimates, not dimensions measured from image pixels. If the required
+visual references are unclear, the app withholds the automatic measurement.
+Motion candidates can be caused by players,
 background movement, or camera shake; calibrated speed is a motion-cluster
 estimate, not shuttle speed. The app does not automatically identify hits,
 track players, or calculate missed-shot distance. YouTube page URLs and other
 webpage URLs are not direct video files; import a video file you are authorized
-to analyze or provide a direct HTTPS link to a supported video file.
+to analyze or provide a direct HTTPS link to a supported video file. Still
+images are not analysis inputs; they may be used as labeled examples for a
+future model-training workflow. This prototype does not include model training.
 
 ## Build
 

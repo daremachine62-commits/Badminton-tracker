@@ -11,6 +11,8 @@ import kotlin.math.sin
 internal data class DetectedCourt(
     val corners: List<CourtPoint>,
     val confidence: Float,
+    val visibleCorners: List<Boolean>,
+    val hasNetReference: Boolean,
 )
 
 internal fun detectCourt(
@@ -123,13 +125,44 @@ internal fun detectCourt(
             val score = votes * (0.2 + areaRatio)
             if (score <= bestScore) continue
 
-            bestScore = score
             val ordered = orderCourtCorners(points, width, height)
+            val visibleCorners = ordered.map { point ->
+                point.x in 0f..width.toFloat() && point.y in 0f..height.toFloat()
+            }
+            val longerBoundaryPair =
+                if (abs(firstPair.first.rho - firstPair.second.rho) >
+                    abs(secondPair.first.rho - secondPair.second.rho)
+                ) {
+                    firstPair
+                } else {
+                    secondPair
+                }
+            val center = CourtPoint(
+                points.sumOf { it.x.toDouble() }.toFloat() / points.size,
+                points.sumOf { it.y.toDouble() }.toFloat() / points.size,
+            )
+            val boundarySeparation =
+                abs(longerBoundaryPair.first.rho - longerBoundaryPair.second.rho)
+            val hasNetReference = candidates.any { line ->
+                val angleDelta = abs(longerBoundaryPair.first.angle - line.angle)
+                val parallelAngleDelta = min(angleDelta, 180 - angleDelta)
+                val centerDistance = abs(
+                    center.x * cosines[line.angle] +
+                        center.y * sines[line.angle] -
+                        line.rho,
+                )
+                parallelAngleDelta <= 8 &&
+                    centerDistance <= max(4.0, boundarySeparation * 0.12) &&
+                    line.votes >= minimumVotes
+            }
+            if (visibleCorners.any { !it } && !hasNetReference) continue
+
+            bestScore = score
             val confidence = (
                 votes.toDouble() / (minimumVotes * 4) *
                     min(1.0, areaRatio)
                 ).toFloat().coerceIn(0f, 1f)
-            best = DetectedCourt(ordered, confidence)
+            best = DetectedCourt(ordered, confidence, visibleCorners, hasNetReference)
         }
     }
     return best?.takeIf { it.confidence >= 0.18f }

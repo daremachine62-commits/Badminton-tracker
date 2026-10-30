@@ -103,7 +103,7 @@ private data class HitLabel(
     val elapsedMillis: Long,
 )
 
-private data class TrainingSession(
+internal data class TrainingSession(
     val completedAtMillis: Long,
     val durationMillis: Long,
     val hitCount: Int,
@@ -249,7 +249,8 @@ private fun SetupScreen(
         Card(modifier = Modifier.fillMaxWidth()) {
             Text(
                 "Live camera recording and experimental motion tracking are available in a " +
-                    "session. You can also analyze a local video or a direct HTTPS video-file URL. " +
+                    "session. You can also analyze a local video or direct HTTPS " +
+                    "video-file URL. " +
                     "A YouTube page URL is not a video file and cannot be analyzed here.",
                 modifier = Modifier.padding(16.dp),
             )
@@ -294,6 +295,7 @@ private fun TrainingHistoryScreen(
                 Text("Tagged hits: ${sessions.sumOf { it.hitCount }}")
             }
         }
+        TrainingTreemap(sessions.take(20))
         Text("Recent sessions", style = MaterialTheme.typography.titleLarge)
         if (sessions.isEmpty()) {
             Text("No completed training sessions yet. End a live session to add it here.")
@@ -478,21 +480,40 @@ private fun VideoAnalysisSummary(
             )
             Text(
                 if (autoDetected) {
-                    "Court auto-estimated from visible lines using standard doubles-court " +
-                        "dimensions. Tap an estimated corner to adjust it."
+                    val detection = result.detectedCourt
+                    if (detection != null && detection.visibleCorners.any { !it } &&
+                        detection.hasNetReference
+                    ) {
+                        "Court estimated from visible markings and a net-line reference. " +
+                            "Missing corners are projected using standard court geometry. " +
+                            "Tap an estimate to adjust it."
+                    } else {
+                        "Court estimated from visible lines using standard doubles-court " +
+                            "geometry. Tap an estimated corner to adjust it."
+                    }
                 } else {
                     "Court was not detected automatically. Tap its four corners in order " +
                         "(top-left, top-right, bottom-right, bottom-left) to calibrate."
                 },
             )
             result.detectedCourt?.let { detection ->
+                Text(
+                    "Visible court corners: ${detection.visibleCorners.count { it }}/4.",
+                )
                 Text("Auto-detection confidence: ${(detection.confidence * 100).toInt()}%")
             }
             CourtCalibrationCanvas(
                 bitmap = result.previewFrame,
                 courtCorners = courtCorners,
                 onManualAdjustment = { autoDetected = false },
+                showCourtDimensions = autoDetected && courtCorners.size == 4,
             )
+            if (autoDetected && courtCorners.size == 4) {
+                Text(
+                    "Estimated standard doubles-court dimensions: 13.4 m × 6.1 m; " +
+                        "not measured directly from image pixels.",
+                )
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Corners: ${courtCorners.size}/4")
                 OutlinedButton(
@@ -525,6 +546,7 @@ private fun CourtCalibrationCanvas(
     bitmap: Bitmap,
     courtCorners: MutableList<CourtPoint>,
     onManualAdjustment: () -> Unit,
+    showCourtDimensions: Boolean = false,
 ) {
     DisposableEffect(bitmap) {
         onDispose { bitmap.recycle() }
@@ -595,6 +617,55 @@ private fun CourtCalibrationCanvas(
                     textSize = 36f
                 },
             )
+        }
+        if (showCourtDimensions && courtCorners.size == 4) {
+            val topLeft = courtCorners[0]
+            val topRight = courtCorners[1]
+            val bottomLeft = courtCorners[3]
+            val topCenterX = left + (topLeft.x + topRight.x) * width / 2f
+            val topCenterY = top + (topLeft.y + topRight.y) * height / 2f
+            val sideCenterX = left + (topLeft.x + bottomLeft.x) * width / 2f
+            val sideCenterY = top + (topLeft.y + bottomLeft.y) * height / 2f
+            val courtCenterX = left + courtCorners.sumOf { it.x.toDouble() }.toFloat() * width / 4f
+            val courtCenterY = top + courtCorners.sumOf { it.y.toDouble() }.toFloat() * height / 4f
+            val topInwardLength = hypot(courtCenterX - topCenterX, courtCenterY - topCenterY)
+                .coerceAtLeast(1f)
+            val topLabelX = topCenterX +
+                (courtCenterX - topCenterX) / topInwardLength * 18.dp.toPx()
+            val topLabelY = topCenterY +
+                (courtCenterY - topCenterY) / topInwardLength * 18.dp.toPx()
+            val sideInwardLength = hypot(courtCenterX - sideCenterX, courtCenterY - sideCenterY)
+                .coerceAtLeast(1f)
+            val sideLabelX = sideCenterX +
+                (courtCenterX - sideCenterX) / sideInwardLength * 18.dp.toPx()
+            val sideLabelY = sideCenterY +
+                (courtCenterY - sideCenterY) / sideInwardLength * 18.dp.toPx()
+            val outlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                textSize = 14.dp.toPx()
+                textAlign = Paint.Align.CENTER
+                style = Paint.Style.STROKE
+                strokeWidth = 4.dp.toPx()
+                color = android.graphics.Color.BLACK
+            }
+            val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                textSize = 14.dp.toPx()
+                textAlign = Paint.Align.CENTER
+                color = android.graphics.Color.YELLOW
+            }
+            val nativeCanvas = drawContext.canvas.nativeCanvas
+            nativeCanvas.drawText("13.4 m", topLabelX, topLabelY, outlinePaint)
+            nativeCanvas.drawText("13.4 m", topLabelX, topLabelY, labelPaint)
+            val sideAngle = Math.toDegrees(
+                kotlin.math.atan2(
+                    (bottomLeft.y - topLeft.y) * height,
+                    (bottomLeft.x - topLeft.x) * width,
+                ).toDouble(),
+            ).toFloat()
+            nativeCanvas.save()
+            nativeCanvas.rotate(sideAngle, sideLabelX, sideLabelY)
+            nativeCanvas.drawText("6.1 m", sideLabelX, sideLabelY, outlinePaint)
+            nativeCanvas.drawText("6.1 m", sideLabelX, sideLabelY, labelPaint)
+            nativeCanvas.restore()
         }
     }
 }
@@ -1270,7 +1341,7 @@ private fun grayscaleBitmap(luminance: IntArray, width: Int, height: Int): Bitma
     }
 }
 
-private fun formatElapsed(elapsedMillis: Long): String {
+internal fun formatElapsed(elapsedMillis: Long): String {
     val totalSeconds = elapsedMillis / 1_000
     val minutes = totalSeconds / 60
     val seconds = totalSeconds % 60
